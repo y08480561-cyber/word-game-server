@@ -1,0 +1,15 @@
+{
+  "name": "word-game-online-server",
+  "version": "1.0.0",
+  "description": "Authoritative Real-Time Multiplayer Backend for Persian Word Battle Game",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node test.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "author": "AI Studio",
+  "license": "MIT"
+}
