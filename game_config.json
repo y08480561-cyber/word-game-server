@@ -1,0 +1,19 @@
+{
+  "minSupportedVersion": 1,
+  "latestVersion": 1,
+  "forceUpdateUrl": "",
+  "maintenanceMode": false,
+  "maintenanceMessage": "سرور بازی در حال به‌روزرسانی و ارتقا می‌باشد. لطفا دقایقی دیگر مجدداً تلاش نمایید.",
+  "announcementBanner": "به مسابقات بزرگ حدس کلمات خوش آمدید! جوایز ویژه ماهانه منتظر شماست 🎁",
+  "announcementType": "INFO",
+  "hintCostCoins": 20,
+  "shuffleCostCoins": 10,
+  "adRewardCoins": 2,
+  "adChallengeBonusCoins": 50,
+  "dailyBonusMultiplier": 1,
+  "doubleRewardsActive": false,
+  "onlineTournamentActive": true,
+  "levelsPackVersion": 1,
+  "lastUpdated": 1790178767383,
+  "lastUpdatedBy": "system"
+}
