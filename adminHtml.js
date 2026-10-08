@@ -2593,12 +2593,41 @@ function getAdminHtml(hostName = "admin.kalametgame.ir") {
       card.style.gap = '8px';
       card.dataset.id = rowId;
 
-      card.innerHTML = 
-        '<div style="display: flex; justify-content: space-between; align-items: center; gap: 8px;">' +
-          '<input type="text" class="form-control template-title-input" style="font-size: 13px; font-weight: bold; flex: 1;" placeholder="عنوان پیام (مثال: 🎁 هدیه روزانه)" value="' + escapeHtml(title) + '">' +
-          '<button type="button" class="btn btn-danger btn-sm" onclick="deleteReminderTemplateRow(this)" style="padding: 4px 10px; font-size: 12px;">🗑️ حذف</button>' +
-        '</div>' +
-        '<textarea class="form-control template-body-input" rows="2" style="font-size: 12.5px;" placeholder="متن پیام یادآوری برای کاربران غایب...">' + escapeHtml(body) + '</textarea>';
+      const topDiv = document.createElement('div');
+      topDiv.style.display = 'flex';
+      topDiv.style.justifyContent = 'space-between';
+      topDiv.style.alignItems = 'center';
+      topDiv.style.gap = '8px';
+
+      const input = document.createElement('input');
+      input.type = 'text';
+      input.className = 'form-control template-title-input';
+      input.style.fontSize = '13px';
+      input.style.fontWeight = 'bold';
+      input.style.flex = '1';
+      input.placeholder = 'عنوان پیام (مثال: هدیه روزانه)';
+      input.value = title;
+
+      const delBtn = document.createElement('button');
+      delBtn.type = 'button';
+      delBtn.className = 'btn btn-danger btn-sm';
+      delBtn.style.padding = '4px 10px';
+      delBtn.style.fontSize = '12px';
+      delBtn.textContent = 'حذف';
+      delBtn.onclick = function() { deleteReminderTemplateRow(delBtn); };
+
+      topDiv.appendChild(input);
+      topDiv.appendChild(delBtn);
+
+      const textarea = document.createElement('textarea');
+      textarea.className = 'form-control template-body-input';
+      textarea.rows = 2;
+      textarea.style.fontSize = '12.5px';
+      textarea.placeholder = 'متن پیام یادآوری برای کاربران غایب...';
+      textarea.value = body;
+
+      card.appendChild(topDiv);
+      card.appendChild(textarea);
       container.appendChild(card);
     }
 

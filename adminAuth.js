@@ -86,18 +86,7 @@ function getAuthenticatedAdmin(req) {
 }
 
 function login(username, password, clientIp = '127.0.0.1') {
-  // 1. Brute-force rate limiting check
-  const ipRecord = failedAttemptsByIp.get(clientIp);
-  if (ipRecord && ipRecord.lockedUntil && Date.now() < ipRecord.lockedUntil) {
-    const remainingMins = Math.ceil((ipRecord.lockedUntil - Date.now()) / (60 * 1000));
-    return {
-      success: false,
-      statusCode: 429,
-      error: `تعداد تلاش‌های ناموفق بیش از حد مجاز است. دسترسی موقتاً مسدود گردید. لطفاً ${remainingMins} دقیقه دیگر تلاش کنید.`
-    };
-  }
-
-  // 2. Fail-Closed Check: If environment variables are missing on Render, fail closed immediately
+  // 1. Fail-Closed Check: If environment variables are missing on Render, fail closed immediately
   if (!db.isAdminConfigured()) {
     console.warn('[SECURITY FAIL-CLOSED] Login rejected: ADMIN_USERNAME and ADMIN_PASSWORD must be configured in environment.');
     return {
@@ -106,7 +95,6 @@ function login(username, password, clientIp = '127.0.0.1') {
       error: 'سیستم ورود مدیریت غیرفعال است: متغیرهای محیطی ADMIN_USERNAME و ADMIN_PASSWORD در سرور تنظیم نشده‌اند.'
     };
   }
-
   if (!username || !password) {
     return {
       success: false,
@@ -114,39 +102,23 @@ function login(username, password, clientIp = '127.0.0.1') {
       error: 'نام کاربری و رمز عبور الزامی است.'
     };
   }
-
-  // 3. Verify credentials using constant-time comparison
+  // 2. Verify credentials using constant-time comparison (No lockout or 15-min blocking)
   const isValid = db.verifyAdminCredentials(username, password);
   if (!isValid) {
-    let record = failedAttemptsByIp.get(clientIp) || { count: 0, lockedUntil: null };
-    record.count += 1;
-    if (record.count >= MAX_FAILED_ATTEMPTS) {
-      record.lockedUntil = Date.now() + LOCKOUT_DURATION_MS;
-      console.warn(`[SECURITY] IP ${clientIp} locked out for 15 minutes due to repeated failed logins.`);
-    }
-    failedAttemptsByIp.set(clientIp, record);
-
     db.addAuditLog(
       String(username).trim() || 'unknown',
       "ADMIN_LOGIN_FAILED",
       "-",
       "Rejected",
-      `ورود ناموفق از IP: ${clientIp} (تلاش ${record.count}/${MAX_FAILED_ATTEMPTS})`
+      `ورود ناموفق از IP: ${clientIp}`
     );
-
-    const remainingAttempts = Math.max(0, MAX_FAILED_ATTEMPTS - record.count);
     return {
       success: false,
       statusCode: 401,
-      error: remainingAttempts > 0
-        ? `نام کاربری یا رمز عبور اشتباه است. (${remainingAttempts} تلاش باقی مانده)`
-        : 'حساب موقتاً به دلیل ۵ تلاش ناموفق مسدود شد. ۱۵ دقیقه دیگر تلاش فرمایید.'
+      error: 'نام کاربری یا رمز عبور اشتباه است.'
     };
   }
-
-  // 4. Successful login: Clear rate limiter for IP
-  failedAttemptsByIp.delete(clientIp);
-
+  // 3. Successful login
   const token = generateSessionToken();
   const session = {
     username: String(username).trim(),
@@ -154,9 +126,7 @@ function login(username, password, clientIp = '127.0.0.1') {
     expiresAt: Date.now() + SESSION_TTL_MS
   };
   activeSessions.set(token, session);
-
   db.addAuditLog(session.username, "ADMIN_LOGIN", "-", "Success", `ورود موفق مدیر به پنل از IP: ${clientIp}`);
-
   return {
     success: true,
     statusCode: 200,
