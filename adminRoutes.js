@@ -51,20 +51,22 @@ async function handleAdminApi(req, res, url, serverContext) {
   // 1. Login
   if (url === '/admin/api/login' && req.method === 'POST') {
     try {
+      const clientIp = adminAuth.extractClientIp(req);
+      const isSecure = adminAuth.isRequestSecure(req);
       const { username, password } = await readJsonBody(req);
-      const session = adminAuth.login(username, password);
-      if (!session) {
-        sendJson(res, 401, { success: false, error: 'نام کاربری یا رمز عبور اشتباه است.' });
+      const result = adminAuth.login(username, password, clientIp);
+      if (!result.success) {
+        sendJson(res, result.statusCode || 401, { success: false, error: result.error });
         return true;
       }
 
-      // Set secure cookie as well
-      res.setHeader('Set-Cookie', `admin_token=${session.token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=86400`);
+      // Set hardened cookie
+      res.setHeader('Set-Cookie', adminAuth.createSessionCookie(result.token, isSecure));
       sendJson(res, 200, {
         success: true,
-        token: session.token,
-        username: session.username,
-        expiresAt: session.expiresAt
+        token: result.token,
+        username: result.username,
+        expiresAt: result.expiresAt
       });
       return true;
     } catch (err) {
@@ -75,8 +77,9 @@ async function handleAdminApi(req, res, url, serverContext) {
 
   // 2. Logout
   if (url === '/admin/api/logout' && req.method === 'POST') {
+    const isSecure = adminAuth.isRequestSecure(req);
     adminAuth.logout(req);
-    res.setHeader('Set-Cookie', `admin_token=; Path=/; HttpOnly; Max-Age=0`);
+    res.setHeader('Set-Cookie', adminAuth.clearSessionCookie(isSecure));
     sendJson(res, 200, { success: true });
     return true;
   }
@@ -368,6 +371,49 @@ async function handleAdminApi(req, res, url, serverContext) {
     }
   }
 
+  // 9.5. Get Hub UI Customization
+  if (url === '/admin/api/hub-ui' && req.method === 'GET') {
+    sendJson(res, 200, {
+      success: true,
+      hubUi: db.getHubUiConfig()
+    });
+    return true;
+  }
+
+  // 9.6. Update Hub UI Customization & Broadcast to Players
+  if ((url === '/admin/api/hub-ui' || url === '/admin/api/hub-ui/update') && req.method === 'POST') {
+    try {
+      const data = await readJsonBody(req);
+      const prev = db.getHubUiConfig();
+      const updated = db.saveHubUiConfig(data, admin.username);
+
+      db.addAuditLog(
+        admin.username,
+        "UPDATE_HUB_UI",
+        "-",
+        "Updated",
+        "ویرایش متون، بخش‌ها و ظاهر صفحه مسابقه از پنل مدیریت وب"
+      );
+
+      if (serverContext.broadcastHubUiUpdate) {
+        serverContext.broadcastHubUiUpdate();
+      }
+      if (serverContext.broadcastGameConfigUpdate) {
+        serverContext.broadcastGameConfigUpdate();
+      }
+
+      sendJson(res, 200, {
+        success: true,
+        message: "متن‌ها و بخش‌های صفحه مسابقه با موفقیت ذخیره و در لحظه برای کلیه کاربران اعمال گردید.",
+        hubUi: updated
+      });
+      return true;
+    } catch (err) {
+      sendJson(res, 400, { success: false, error: 'خطا در ذخیره متون: ' + err.message });
+      return true;
+    }
+  }
+
   // 10. Live Flash Broadcast to All Connected Players
   if (url === '/admin/api/broadcast/announcement' && req.method === 'POST') {
     try {
@@ -438,6 +484,203 @@ async function handleAdminApi(req, res, url, serverContext) {
       return true;
     } catch (err) {
       sendJson(res, 400, { success: false, error: 'خطا در ذخیره مراحل: ' + err.message });
+      return true;
+    }
+  }
+
+  // 13. Get Notifications & Reminder Settings
+  if (url === '/admin/api/notifications' && req.method === 'GET') {
+    const settings = db.getNotificationSettings();
+    const notifications = db.getNotifications(50);
+    sendJson(res, 200, {
+      success: true,
+      settings,
+      notifications,
+      stats: {
+        totalSent: notifications.length,
+        activeConnections: wss && wss.clients ? wss.clients.size : 0
+      }
+    });
+    return true;
+  }
+
+  // 14. Send Instant Push & Inactivity Notification to All Users
+  if (url === '/admin/api/notifications/send' && req.method === 'POST') {
+    try {
+      const data = await readJsonBody(req);
+      const title = String(data.title || '').trim();
+      const body = String(data.body || data.message || '').trim();
+      const type = String(data.type || 'REENGAGEMENT').toUpperCase();
+      const target = String(data.target || 'ALL').toUpperCase();
+
+      if (!title) {
+        sendJson(res, 400, { success: false, error: 'عنوان اعلان نمی‌تواند خالی باشد.' });
+        return true;
+      }
+      if (!body) {
+        sendJson(res, 400, { success: false, error: 'متن پیام اعلان نمی‌تواند خالی باشد.' });
+        return true;
+      }
+
+      // Save to database
+      const notif = db.addNotification({
+        title,
+        body,
+        type,
+        target,
+        deliveryCount: wss && wss.clients ? wss.clients.size : 0
+      }, admin.username);
+
+      // Broadcast immediately to online players
+      let onlineDelivered = 0;
+      if (serverContext.broadcastNotification) {
+        onlineDelivered = serverContext.broadcastNotification(notif);
+      }
+
+      db.addAuditLog(
+        admin.username,
+        "SEND_INSTANT_NOTIFICATION",
+        "-",
+        `[${title}] ${body}`,
+        `ارسال اعلان فوری به کاربران (${onlineDelivered} کاربر آنلاین در لحظه دریافت کردند)`
+      );
+
+      sendJson(res, 200, {
+        success: true,
+        message: "اعلان با موفقیت ثبت، برای کاربران آنلاین ارسال، و در صف دریافت آفلاین قرار گرفت.",
+        notification: notif,
+        onlineDelivered
+      });
+      return true;
+    } catch (err) {
+      sendJson(res, 400, { success: false, error: 'خطا در ارسال اعلان: ' + err.message });
+      return true;
+    }
+  }
+
+  // 15. Update Inactivity & Automated Reminder Settings
+  if (url === '/admin/api/notifications/settings' && req.method === 'POST') {
+    try {
+      const data = await readJsonBody(req);
+      const prevSettings = db.getNotificationSettings();
+      const updates = {};
+
+      if (typeof data.inactivityRemindersEnabled === 'boolean') {
+        updates.inactivityRemindersEnabled = data.inactivityRemindersEnabled;
+      }
+      if (typeof data.inactivityHours === 'number' && data.inactivityHours > 0) {
+        updates.inactivityHours = data.inactivityHours;
+      }
+      if (Array.isArray(data.reminderTemplates)) {
+        updates.reminderTemplates = data.reminderTemplates;
+      }
+
+      const saved = db.saveNotificationSettings(updates, admin.username);
+
+      db.addAuditLog(
+        admin.username,
+        "UPDATE_NOTIFICATION_SETTINGS",
+        JSON.stringify(prevSettings),
+        JSON.stringify(saved),
+        "بروزرسانی زمان‌بندی و متن‌های یادآوری ۲۴ ساعته کاربران غیرفعال"
+      );
+
+      sendJson(res, 200, {
+        success: true,
+        message: "تنظیمات اعلان‌ها و یادآوری خودکار با موفقیت ذخیره گردید.",
+        settings: saved
+      });
+      return true;
+    } catch (err) {
+      sendJson(res, 400, { success: false, error: 'خطا در ذخیره تنظیمات: ' + err.message });
+      return true;
+    }
+  }
+
+  // 16. Get & Manage Users (Coins, Rating, Ban status)
+  if (url === '/admin/api/users' && req.method === 'GET') {
+    const all = db.getAllUsers();
+    sendJson(res, 200, { success: true, count: all.length, users: all });
+    return true;
+  }
+
+  if (url === '/admin/api/users/update' && req.method === 'POST') {
+    try {
+      const { userId, coins, rating, monthlyScore, isBanned } = await readJsonBody(req);
+      if (!userId) {
+        sendJson(res, 400, { success: false, error: 'شناسه یا نام کاربری بازیکن الزامی است.' });
+        return true;
+      }
+
+      const updates = {};
+      if (typeof coins === 'number') updates.coins = Math.max(0, Math.floor(coins));
+      if (typeof rating === 'number') updates.rating = Math.max(100, Math.floor(rating));
+      if (typeof monthlyScore === 'number') updates.monthlyScore = Math.max(0, Math.floor(monthlyScore));
+      if (typeof isBanned === 'boolean') updates.isBanned = isBanned;
+
+      const result = db.updateUser(userId, updates, admin.username);
+      if (!result) {
+        sendJson(res, 404, { success: false, error: 'بازیکن مورد نظر یافت نشد.' });
+        return true;
+      }
+
+      // If user is currently in memory map (users), update it too
+      if (users && users.has(result.updated.id)) {
+        users.set(result.updated.id, result.updated);
+      }
+
+      db.addAuditLog(
+        admin.username,
+        "UPDATE_USER_DATA",
+        JSON.stringify(result.previous),
+        JSON.stringify(result.updated),
+        `ویرایش اطلاعات بازیکن ${result.updated.username || userId}`
+      );
+
+      sendJson(res, 200, {
+        success: true,
+        message: `اطلاعات بازیکن ${result.updated.username || userId} با موفقیت بروزرسانی شد.`,
+        user: result.updated
+      });
+      return true;
+    } catch (err) {
+      sendJson(res, 400, { success: false, error: 'خطا در ویرایش اطلاعات بازیکن: ' + err.message });
+      return true;
+    }
+  }
+
+  // 17. Get & Update Daily Lucky Wheel Config (Prizes & Probabilities)
+  if (url === '/admin/api/wheel' && req.method === 'GET') {
+    const wheel = db.getWheelConfig();
+    sendJson(res, 200, { success: true, wheel });
+    return true;
+  }
+
+  if (url === '/admin/api/wheel/update' && req.method === 'POST') {
+    try {
+      const { wheel } = await readJsonBody(req);
+      if (!Array.isArray(wheel)) {
+        sendJson(res, 400, { success: false, error: 'اطلاعات گردونه باید به صورت آرایه‌ای از ۸ خانه ارسال شود.' });
+        return true;
+      }
+
+      const saved = db.saveWheelConfig(wheel, admin.username);
+      db.addAuditLog(
+        admin.username,
+        "UPDATE_LUCKY_WHEEL",
+        "-",
+        `${saved.length} خانه گردونه شانس`,
+        "بروزرسانی جوایز و شانس‌های گردونه شانس روزانه از پنل وب"
+      );
+
+      sendJson(res, 200, {
+        success: true,
+        message: "جوایز و تنظیمات گردونه شانس روزانه با موفقیت ذخیره گردید.",
+        wheel: saved
+      });
+      return true;
+    } catch (err) {
+      sendJson(res, 400, { success: false, error: 'خطا در ذخیره تنظیمات گردونه: ' + err.message });
       return true;
     }
   }

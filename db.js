@@ -25,6 +25,9 @@ const GAME_CONFIG_FILE = path.join(DATA_DIR, 'game_config.json');
 const LEVELS_FILE = path.join(DATA_DIR, 'custom_levels.json');
 const LEADS_FILE = path.join(DATA_DIR, 'player_leads.json');
 const CYCLES_FILE = path.join(DATA_DIR, 'cycle_history.json');
+const NOTIFICATIONS_FILE = path.join(DATA_DIR, 'notifications.json');
+const NOTIFICATION_SETTINGS_FILE = path.join(DATA_DIR, 'notification_settings.json');
+const WHEEL_CONFIG_FILE = path.join(DATA_DIR, 'wheel_config.json');
 
 // Helper for atomic file write
 function safeWriteJsonSync(filePath, data) {
@@ -222,67 +225,50 @@ function addAuditLog(admin, action, prevVal, newVal, details = "") {
 }
 
 // -------------------------------------------------------------
-// 3. Admin Authentication & Credential Management
+// 3. Admin Authentication & Credential Management (STRICT FAIL-CLOSED)
 // -------------------------------------------------------------
-function hashPassword(password, salt) {
-  return crypto.scryptSync(password, salt, 64).toString('hex');
-}
-
-function initAdminUser() {
-  const existing = safeReadJsonSync(ADMINS_FILE, null);
-  if (existing && existing.username && existing.salt && existing.hash) {
-    return existing;
-  }
-
-  // Initial secure administrator credentials
-  const adminUsername = process.env.ADMIN_USERNAME || 'admin';
-  const adminPassword = process.env.ADMIN_PASSWORD || 'adminPassword123!';
-  const salt = crypto.randomBytes(16).toString('hex');
-  const hash = hashPassword(adminPassword, salt);
-
-  const adminData = {
-    username: adminUsername,
-    salt,
-    hash,
-    createdAt: Date.now()
-  };
-
-  safeWriteJsonSync(ADMINS_FILE, adminData);
-  console.log(`[DB] Created primary administrator user: "${adminUsername}"`);
-  return adminData;
+function isAdminConfigured() {
+  const user = process.env.ADMIN_USERNAME;
+  const pass = process.env.ADMIN_PASSWORD;
+  return Boolean(
+    user &&
+    typeof user === 'string' &&
+    user.trim().length > 0 &&
+    pass &&
+    typeof pass === 'string' &&
+    pass.trim().length > 0
+  );
 }
 
 function verifyAdminCredentials(username, password) {
-  const admin = safeReadJsonSync(ADMINS_FILE, null) || initAdminUser();
-  if (!admin || !username || !password) return false;
-
-  const inputUser = String(username).trim().toLowerCase();
-  const configuredUser = String(admin.username || 'admin').trim().toLowerCase();
-  if (inputUser !== configuredUser && inputUser !== 'admin') return false;
-
-  const cleanPass = String(password).trim();
-
-  // 1. Direct match for standard default passwords
-  if (
-    cleanPass === 'adminPassword123!' ||
-    cleanPass === 'KalametAdmin@2026!' ||
-    cleanPass === 'admin123' ||
-    cleanPass === 'admin'
-  ) {
-    return true;
+  // STRICT FAIL-CLOSED: If environment variables are missing on Render, fail closed immediately.
+  if (!isAdminConfigured()) {
+    console.warn('[SECURITY] Admin login rejected: ADMIN_USERNAME or ADMIN_PASSWORD is NOT configured in environment.');
+    return false;
   }
 
-  // 2. Cryptographic hash check against stored salt and hash
+  if (!username || !password) return false;
+
+  const expectedUser = String(process.env.ADMIN_USERNAME).trim();
+  const expectedPass = String(process.env.ADMIN_PASSWORD).trim();
+  const inputUser = String(username).trim();
+  const inputPass = String(password).trim();
+
   try {
-    const testHash = hashPassword(cleanPass, admin.salt);
-    if (crypto.timingSafeEqual(Buffer.from(testHash, 'hex'), Buffer.from(admin.hash, 'hex'))) {
-      return true;
-    }
-  } catch (err) {
-    console.error('[DB] verifyAdminCredentials error:', err.message);
-  }
+    // Constant-time comparison using fixed-length SHA-256 digests to prevent timing attacks
+    const userHashA = crypto.createHash('sha256').update(inputUser).digest();
+    const userHashB = crypto.createHash('sha256').update(expectedUser).digest();
+    const isUserMatch = crypto.timingSafeEqual(userHashA, userHashB);
 
-  return false;
+    const passHashA = crypto.createHash('sha256').update(inputPass).digest();
+    const passHashB = crypto.createHash('sha256').update(expectedPass).digest();
+    const isPassMatch = crypto.timingSafeEqual(passHashA, passHashB);
+
+    return isUserMatch && isPassMatch;
+  } catch (err) {
+    console.error('[SECURITY] Error during timingSafeEqual comparison:', err.message);
+    return false;
+  }
 }
 
 // -------------------------------------------------------------
@@ -323,8 +309,101 @@ function saveUsers(userMap) {
 }
 
 // -------------------------------------------------------------
-// 5. Remote Game Configuration & Dynamic Levels
+// 5. Remote Game Configuration & Dynamic Levels & Remote UI Architecture
 // -------------------------------------------------------------
+const HUB_REMOTE_UI_FILE = path.join(DATA_DIR, 'hub_remote_ui.json');
+
+function getDefaultHubUi() {
+  return {
+    screenTitle: "🏆 رقابت آنلاین",
+    showScreenTitle: true,
+    showCoinsPill: true,
+
+    showProfileCard: true,
+    profileEditLabel: "ویرایش ✏️",
+    showProfileRating: true,
+    showProfileRank: true,
+
+    showSponsorBanner: false,
+    sponsorTitle: "اسپانسر ویژه مسابقه",
+    sponsorSubtitle: "کلمه‌ت با همکاری حامیان مالی",
+    sponsorImageUrl: "",
+    sponsorTargetUrl: "",
+
+    showPrizeBanner: true,
+    prizeBannerTitle: "🎁 جوایز برتر دوره",
+    prizeDetailsButtonText: "🏆 جزئیات جوایز",
+    prize1Text: "ایرپاد",
+    prize1Icon: "🥇",
+    prize2Text: "۵۰۰ سکه",
+    prize2Icon: "🥈",
+    prize3Text: "۲۰۰ سکه",
+    prize3Icon: "🥉",
+
+    showTournamentCard: true,
+    tournamentTitle: "🏆 رقابت فصل 2",
+    statusActiveLabel: "🟢 فعال",
+    statusInactiveLabel: "🔒 متوقف",
+    countdownTitle: "زمان باقیمانده تا پایان مسابقه:",
+    countdownDayLabel: "روز",
+    countdownHourLabel: "ساعت",
+    countdownMinuteLabel: "دقیقه",
+    countdownSecondLabel: "ثانیه",
+    scoreLabel: "امتیاز شما:",
+    rankLabel: "رتبه شما:",
+
+    showActionCard: true,
+    showLeaderboardButton: true,
+    leaderboardButtonText: "🏆 جدول رقابت",
+    showStartMatchButton: true,
+    startMatchButtonText: "⚔️ شروع رقابت (۲ سکه)",
+    showWinnersButton: true,
+    winnersButtonText: "👑 مشاهده برندگان مسابقه (۳ نفر اول)",
+
+    showServerBadge: true,
+    serverConnectedText: "🇮🇷 سرور ایران (ملی بدون فیلترشکن - فعال)",
+    serverConnectingText: "🇮🇷 سرور ایران (در حال اتصال...)",
+
+    showFooterText: true,
+    footerText: "توسعه‌دهندگان بازی کلمه‌ت ⭐",
+
+    sectionOrder: [
+      "topBar",
+      "sponsorBanner",
+      "profileCard",
+      "prizeBanner",
+      "tournamentCard",
+      "actionCard",
+      "serverBadge",
+      "footerText"
+    ],
+
+    styling: {
+      titleFontSize: 22,
+      bodyFontSize: 14,
+      buttonFontSize: 15,
+      fontWeight: "Bold",
+      fontFamily: "Default",
+      screenBgColor: "#1A0F07",
+      screenBgGradientEnd: "#0D0704",
+      textColor: "#FFD54F",
+      subtitleTextColor: "#FFF8E7",
+      cardBgColor: "#2E1C0C",
+      cardBgGradientEnd: "#1B0F06",
+      buttonPrimaryColor: "#43A047",
+      buttonSecondaryColor: "#8D6E63",
+      buttonTextColor: "#FFFFFF",
+      cardCornerRadiusDp: 16,
+      cardBorderColor: "#D49A37",
+      cardBorderWidthDp: 1.5,
+      cardElevationDp: 6,
+      cardPaddingDp: 14,
+      cardSpacingDp: 12,
+      screenHorizontalPaddingDp: 16
+    }
+  };
+}
+
 function getDefaultGameConfig() {
   return {
     minSupportedVersion: 1,
@@ -342,6 +421,7 @@ function getDefaultGameConfig() {
     doubleRewardsActive: false,
     onlineTournamentActive: true,
     levelsPackVersion: 1,
+    hubUi: getDefaultHubUi(),
     lastUpdated: Date.now(),
     lastUpdatedBy: "system"
   };
@@ -353,7 +433,11 @@ function loadGameConfig() {
   const loaded = safeReadJsonSync(GAME_CONFIG_FILE, null);
   const defaults = getDefaultGameConfig();
   if (loaded) {
-    gameConfig = { ...defaults, ...loaded };
+    gameConfig = {
+      ...defaults,
+      ...loaded,
+      hubUi: { ...getDefaultHubUi(), ...(loaded.hubUi || {}) }
+    };
   } else {
     gameConfig = { ...defaults };
     safeWriteJsonSync(GAME_CONFIG_FILE, gameConfig);
@@ -363,7 +447,46 @@ function loadGameConfig() {
 
 function getGameConfig() {
   if (!gameConfig) loadGameConfig();
+  if (!gameConfig.hubUi) {
+    gameConfig.hubUi = getDefaultHubUi();
+  }
   return gameConfig;
+}
+
+function getHubUiConfig() {
+  const defaults = getDefaultHubUi();
+  const dedicated = safeReadJsonSync(HUB_REMOTE_UI_FILE, null);
+  const cfg = getGameConfig();
+  const stored = dedicated || cfg.hubUi || {};
+  return {
+    ...defaults,
+    ...stored,
+    styling: {
+      ...defaults.styling,
+      ...(stored.styling || {})
+    },
+    sectionOrder: Array.isArray(stored.sectionOrder) && stored.sectionOrder.length > 0
+      ? stored.sectionOrder
+      : defaults.sectionOrder
+  };
+}
+
+function saveHubUiConfig(newHubUi, adminUser = "admin") {
+  const current = getHubUiConfig();
+  const merged = {
+    ...current,
+    ...newHubUi,
+    styling: {
+      ...current.styling,
+      ...(newHubUi.styling || {})
+    },
+    sectionOrder: Array.isArray(newHubUi.sectionOrder) && newHubUi.sectionOrder.length > 0
+      ? newHubUi.sectionOrder
+      : current.sectionOrder
+  };
+  safeWriteJsonSync(HUB_REMOTE_UI_FILE, merged);
+  saveGameConfig({ hubUi: merged }, adminUser);
+  return merged;
 }
 
 function saveGameConfig(newConfig, adminUser = "admin") {
@@ -427,14 +550,189 @@ function addPlayerLead(lead) {
   return lead;
 }
 
+// -------------------------------------------------------------
+// 6. Push & Inactivity Notification System
+// -------------------------------------------------------------
+function getDefaultNotificationSettings() {
+  return {
+    inactivityRemindersEnabled: true,
+    inactivityHours: 24,
+    reminderTemplates: [
+      {
+        id: "rem_1",
+        title: "🎁 سکه‌های رایگان امروزت رو گرفتی؟",
+        body: "گردونه شانس و سکه رایگان امروز منتظرته! همین حالا بیا بازی کن و سکه بگیر."
+      },
+      {
+        id: "rem_2",
+        title: "⚔️ حریفت منتظرته!",
+        body: "بازیکنان جدید توی رقابت آنلاین فعال شدن. بیا و قدرت کلماتت رو ثابت کن!"
+      },
+      {
+        id: "rem_3",
+        title: "🌟 چالش روزانه جدید آمادست",
+        body: "امروز با چند دقیقه بازی می‌تونی سکه‌های هدیه برنده بشی. بیا کلمه‌ها رو بساز!"
+      },
+      {
+        id: "rem_4",
+        title: "👑 صدر لیدربورد منتظر توست!",
+        body: "امتیازت رو بالا ببر و اسم خودت رو بالای جدول برترین‌های کشور ثبت کن."
+      },
+      {
+        id: "rem_5",
+        title: "💎 دلتنگت شدیم! هدیه بازگشت به بازی",
+        body: "خیلی وقته به کلمه‌ت سر نزدی! وارد بازی شو و جایزه ویژه بازگشتت رو تحویل بگیر."
+      }
+    ],
+    lastUpdated: Date.now(),
+    lastUpdatedBy: "system"
+  };
+}
+
+let notificationSettings = null;
+let notificationsList = null;
+
+function loadNotificationSettings() {
+  const loaded = safeReadJsonSync(NOTIFICATION_SETTINGS_FILE, null);
+  const defaults = getDefaultNotificationSettings();
+  if (loaded) {
+    notificationSettings = { ...defaults, ...loaded };
+  } else {
+    notificationSettings = { ...defaults };
+    safeWriteJsonSync(NOTIFICATION_SETTINGS_FILE, notificationSettings);
+  }
+  return notificationSettings;
+}
+
+function getNotificationSettings() {
+  if (!notificationSettings) loadNotificationSettings();
+  return notificationSettings;
+}
+
+function saveNotificationSettings(newSettings, adminUser = "admin") {
+  notificationSettings = {
+    ...getNotificationSettings(),
+    ...newSettings,
+    lastUpdated: Date.now(),
+    lastUpdatedBy: adminUser
+  };
+  safeWriteJsonSync(NOTIFICATION_SETTINGS_FILE, notificationSettings);
+  return notificationSettings;
+}
+
+function loadNotifications() {
+  notificationsList = safeReadJsonSync(NOTIFICATIONS_FILE, []);
+  return notificationsList;
+}
+
+function getNotifications(limit = 100) {
+  if (!notificationsList) loadNotifications();
+  return (notificationsList || []).slice(-limit).reverse();
+}
+
+function getLatestNotification() {
+  const list = getNotifications(1);
+  if (list && list.length > 0) {
+    const latest = list[0];
+    // Return if sent within last 7 days
+    if (Date.now() - latest.timestamp < 7 * 86400 * 1000) {
+      return latest;
+    }
+  }
+  return null;
+}
+
+function addNotification(notif, adminUser = "admin") {
+  if (!notificationsList) loadNotifications();
+  if (!Array.isArray(notificationsList)) notificationsList = [];
+
+  const entry = {
+    id: notif.id || `notif_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
+    title: String(notif.title || '').trim(),
+    body: String(notif.body || '').trim(),
+    type: String(notif.type || 'REENGAGEMENT').toUpperCase(),
+    target: String(notif.target || 'ALL').toUpperCase(),
+    timestamp: Date.now(),
+    dateString: new Date().toISOString().replace('T', ' ').substring(0, 19),
+    sentBy: adminUser,
+    status: 'SENT',
+    deliveryCount: notif.deliveryCount || 0
+  };
+
+  notificationsList.push(entry);
+  if (notificationsList.length > 500) {
+    notificationsList = notificationsList.slice(-500);
+  }
+  safeWriteJsonSync(NOTIFICATIONS_FILE, notificationsList);
+  return entry;
+}
+
+// -------------------------------------------------------------
+// 7. Users Management & Wheel of Fortune Config
+// -------------------------------------------------------------
+function getAllUsers() {
+  const saved = safeReadJsonSync(USERS_FILE, []);
+  return Array.isArray(saved) ? saved : [];
+}
+
+function updateUser(userId, updates, adminUser = "admin") {
+  const list = getAllUsers();
+  const index = list.findIndex(u => u.id === userId || u.username === userId);
+  if (index === -1) return null;
+
+  const prev = { ...list[index] };
+  list[index] = { ...list[index], ...updates, lastModified: Date.now() };
+  safeWriteJsonSync(USERS_FILE, list);
+  return { updated: list[index], previous: prev };
+}
+
+function getDefaultWheelConfig() {
+  return [
+    { id: 0, coins: 5, weightPercent: 42.0, label: "۵ سکه" },
+    { id: 1, coins: 10, weightPercent: 5.0, label: "۱۰ سکه" },
+    { id: 2, coins: 20, weightPercent: 22.0, label: "۲۰ سکه" },
+    { id: 3, coins: 30, weightPercent: 15.0, label: "۳۰ سکه" },
+    { id: 4, coins: 50, weightPercent: 9.0, label: "۵۰ سکه" },
+    { id: 5, coins: 100, weightPercent: 5.0, label: "۱۰۰ سکه" },
+    { id: 6, coins: 250, weightPercent: 1.5, label: "۲۵۰ سکه" },
+    { id: 7, coins: 500, weightPercent: 0.5, label: "۵۰۰ سکه" }
+  ];
+}
+
+let wheelConfig = null;
+
+function loadWheelConfig() {
+  const loaded = safeReadJsonSync(WHEEL_CONFIG_FILE, null);
+  if (loaded && Array.isArray(loaded)) {
+    wheelConfig = loaded;
+  } else {
+    wheelConfig = getDefaultWheelConfig();
+    safeWriteJsonSync(WHEEL_CONFIG_FILE, wheelConfig);
+  }
+  return wheelConfig;
+}
+
+function getWheelConfig() {
+  if (!wheelConfig) loadWheelConfig();
+  return wheelConfig;
+}
+
+function saveWheelConfig(newConfig, adminUser = "admin") {
+  wheelConfig = Array.isArray(newConfig) ? newConfig : getDefaultWheelConfig();
+  safeWriteJsonSync(WHEEL_CONFIG_FILE, wheelConfig);
+  return wheelConfig;
+}
+
 // Initial load
 loadTournament();
 loadCycleHistory();
 loadAuditLogs();
-initAdminUser();
 loadGameConfig();
 loadLevels();
 loadPlayerLeads();
+loadNotificationSettings();
+loadNotifications();
+loadWheelConfig();
 
 module.exports = {
   getTournament,
@@ -445,13 +743,26 @@ module.exports = {
   resetMonthlyScores,
   getAuditLogs,
   addAuditLog,
+  isAdminConfigured,
   verifyAdminCredentials,
   loadUsers,
   saveUsers,
+  getAllUsers,
+  updateUser,
   getGameConfig,
   saveGameConfig,
+  getHubUiConfig,
+  saveHubUiConfig,
+  getDefaultHubUi,
   getLevels,
   saveLevels,
   getPlayerLeads,
-  addPlayerLead
+  addPlayerLead,
+  getNotificationSettings,
+  saveNotificationSettings,
+  getNotifications,
+  getLatestNotification,
+  addNotification,
+  getWheelConfig,
+  saveWheelConfig
 };

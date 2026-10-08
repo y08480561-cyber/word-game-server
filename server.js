@@ -305,6 +305,24 @@ function broadcastGameConfigUpdate() {
   }
 }
 
+function broadcastHubUiUpdate() {
+  const hubUi = db.getHubUiConfig();
+  const payload = {
+    type: "hub_ui_update",
+    hubUi,
+    timestamp: Date.now()
+  };
+  if (wss && wss.clients) {
+    wss.clients.forEach(client => {
+      if (client.readyState === 1 /* OPEN */) {
+        try {
+          client.send(JSON.stringify(payload));
+        } catch (err) {}
+      }
+    });
+  }
+}
+
 function broadcastAnnouncement(message, type = "INFO") {
   const payload = {
     type: "announcement_broadcast",
@@ -338,6 +356,30 @@ function broadcastLevelsUpdate() {
       }
     });
   }
+}
+
+function broadcastNotification(notif) {
+  const payload = {
+    type: "push_notification",
+    id: notif.id,
+    title: notif.title,
+    body: notif.body,
+    notifType: notif.type || "REENGAGEMENT",
+    target: notif.target || "ALL",
+    timestamp: notif.timestamp || Date.now()
+  };
+  let count = 0;
+  if (wss && wss.clients) {
+    wss.clients.forEach(client => {
+      if (client.readyState === 1 /* OPEN */) {
+        try {
+          client.send(JSON.stringify(payload));
+          count++;
+        } catch (err) {}
+      }
+    });
+  }
+  return count;
 }
 
 // Leaderboard calculation
@@ -590,8 +632,10 @@ const serverContext = {
   getAuthoritativeTournamentState,
   broadcastTournamentUpdate,
   broadcastGameConfigUpdate,
+  broadcastHubUiUpdate,
   broadcastAnnouncement,
   broadcastLevelsUpdate,
+  broadcastNotification,
   getSortedLeaderboard,
   users,
   activeMatches,
@@ -678,6 +722,19 @@ const server = http.createServer(async (req, res) => {
       doubleRewardsActive: Boolean(cfg.doubleRewardsActive),
       onlineTournamentActive: Boolean(cfg.onlineTournamentActive),
       levelsPackVersion: cfg.levelsPackVersion || 1,
+      hubUi: cfg.hubUi || db.getHubUiConfig(),
+      timestamp: Date.now()
+    }));
+    return;
+  }
+
+  // 4.1. Dedicated Remote UI API for Online Tournament Hub Screen
+  if (url === '/api/remote-ui/tournament' || url === '/api/v1/remote-ui/hub' || url === '/api/remote-ui') {
+    const hubUi = db.getHubUiConfig();
+    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+    res.end(JSON.stringify({
+      success: true,
+      hubUi,
       timestamp: Date.now()
     }));
     return;
@@ -787,6 +844,31 @@ const server = http.createServer(async (req, res) => {
         res.end(JSON.stringify({ error: "Invalid JSON payload: " + err.message }));
       }
     });
+    return;
+  }
+
+  // 6.5. Public Notifications & Inactivity Reminders API (For Android Clients & WorkManager)
+  if (url === '/api/v1/notifications/latest' || url === '/api/notifications/latest') {
+    const latestNotif = db.getLatestNotification();
+    const settings = db.getNotificationSettings();
+    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+    res.end(JSON.stringify({
+      success: true,
+      latestNotification: latestNotif,
+      settings: settings,
+      timestamp: Date.now()
+    }));
+    return;
+  }
+
+  // 6.6. Public Lucky Wheel Configuration API
+  if (url === '/api/v1/wheel' || url === '/api/wheel') {
+    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+    res.end(JSON.stringify({
+      success: true,
+      wheel: db.getWheelConfig(),
+      timestamp: Date.now()
+    }));
     return;
   }
 

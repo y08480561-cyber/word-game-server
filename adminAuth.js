@@ -1,16 +1,35 @@
 /**
- * Secure Administrator Authentication & Session Management
- * Protects admin API routes and verifies admin sessions.
+ * Production Administrator Authentication & Session Management
+ * Strict Fail-Closed Security, Brute-Force Rate Limiting & Zero Hardcoded Passwords
  */
 
 const crypto = require('crypto');
 const db = require('./db');
 
 const SESSION_TTL_MS = 24 * 60 * 60 * 1000; // 24 Hours
-const activeSessions = new Map(); // token -> { username, expiresAt }
+const MAX_FAILED_ATTEMPTS = 5;
+const LOCKOUT_DURATION_MS = 15 * 60 * 1000; // 15 Minutes
+
+const activeSessions = new Map(); // token -> { username, createdAt, expiresAt }
+const failedAttemptsByIp = new Map(); // clientIp -> { count, lockedUntil }
 
 function generateSessionToken() {
   return crypto.randomBytes(32).toString('hex');
+}
+
+function extractClientIp(req) {
+  if (!req) return '127.0.0.1';
+  const forwarded = req.headers['x-forwarded-for'];
+  if (forwarded && typeof forwarded === 'string') {
+    return forwarded.split(',')[0].trim();
+  }
+  return req.socket?.remoteAddress || req.connection?.remoteAddress || '127.0.0.1';
+}
+
+function isRequestSecure(req) {
+  if (!req) return false;
+  const proto = req.headers['x-forwarded-proto'];
+  return proto === 'https' || Boolean(req.socket?.encrypted) || Boolean(req.connection?.encrypted);
 }
 
 function parseCookies(cookieHeader) {
@@ -38,7 +57,7 @@ function extractToken(req) {
     return cookies['admin_token'];
   }
 
-  // 3. Query parameter: ?token=<token> (fallback for downloads/SSE)
+  // 3. Query parameter: ?token=<token>
   if (req.url && req.url.includes('token=')) {
     try {
       const u = new URL(req.url, 'http://localhost');
@@ -66,35 +85,109 @@ function getAuthenticatedAdmin(req) {
   return { username: session.username, token };
 }
 
-function login(username, password) {
-  if (!username || !password) return null;
+function login(username, password, clientIp = '127.0.0.1') {
+  // 1. Brute-force rate limiting check
+  const ipRecord = failedAttemptsByIp.get(clientIp);
+  if (ipRecord && ipRecord.lockedUntil && Date.now() < ipRecord.lockedUntil) {
+    const remainingMins = Math.ceil((ipRecord.lockedUntil - Date.now()) / (60 * 1000));
+    return {
+      success: false,
+      statusCode: 429,
+      error: `تعداد تلاش‌های ناموفق بیش از حد مجاز است. دسترسی موقتاً مسدود گردید. لطفاً ${remainingMins} دقیقه دیگر تلاش کنید.`
+    };
+  }
+
+  // 2. Fail-Closed Check: If environment variables are missing on Render, fail closed immediately
+  if (!db.isAdminConfigured()) {
+    console.warn('[SECURITY FAIL-CLOSED] Login rejected: ADMIN_USERNAME and ADMIN_PASSWORD must be configured in environment.');
+    return {
+      success: false,
+      statusCode: 503,
+      error: 'سیستم ورود مدیریت غیرفعال است: متغیرهای محیطی ADMIN_USERNAME و ADMIN_PASSWORD در سرور تنظیم نشده‌اند.'
+    };
+  }
+
+  if (!username || !password) {
+    return {
+      success: false,
+      statusCode: 400,
+      error: 'نام کاربری و رمز عبور الزامی است.'
+    };
+  }
+
+  // 3. Verify credentials using constant-time comparison
   const isValid = db.verifyAdminCredentials(username, password);
-  if (!isValid) return null;
+  if (!isValid) {
+    let record = failedAttemptsByIp.get(clientIp) || { count: 0, lockedUntil: null };
+    record.count += 1;
+    if (record.count >= MAX_FAILED_ATTEMPTS) {
+      record.lockedUntil = Date.now() + LOCKOUT_DURATION_MS;
+      console.warn(`[SECURITY] IP ${clientIp} locked out for 15 minutes due to repeated failed logins.`);
+    }
+    failedAttemptsByIp.set(clientIp, record);
+
+    db.addAuditLog(
+      String(username).trim() || 'unknown',
+      "ADMIN_LOGIN_FAILED",
+      "-",
+      "Rejected",
+      `ورود ناموفق از IP: ${clientIp} (تلاش ${record.count}/${MAX_FAILED_ATTEMPTS})`
+    );
+
+    const remainingAttempts = Math.max(0, MAX_FAILED_ATTEMPTS - record.count);
+    return {
+      success: false,
+      statusCode: 401,
+      error: remainingAttempts > 0
+        ? `نام کاربری یا رمز عبور اشتباه است. (${remainingAttempts} تلاش باقی مانده)`
+        : 'حساب موقتاً به دلیل ۵ تلاش ناموفق مسدود شد. ۱۵ دقیقه دیگر تلاش فرمایید.'
+    };
+  }
+
+  // 4. Successful login: Clear rate limiter for IP
+  failedAttemptsByIp.delete(clientIp);
 
   const token = generateSessionToken();
   const session = {
-    username: username.trim(),
+    username: String(username).trim(),
     createdAt: Date.now(),
     expiresAt: Date.now() + SESSION_TTL_MS
   };
   activeSessions.set(token, session);
 
-  db.addAuditLog(username, "ADMIN_LOGIN", "-", "Success", "Administrator logged into Admin Panel");
-  return { token, username: session.username, expiresAt: session.expiresAt };
+  db.addAuditLog(session.username, "ADMIN_LOGIN", "-", "Success", `ورود موفق مدیر به پنل از IP: ${clientIp}`);
+
+  return {
+    success: true,
+    statusCode: 200,
+    token,
+    username: session.username,
+    expiresAt: session.expiresAt
+  };
 }
 
 function logout(req) {
   const token = extractToken(req);
   if (token && activeSessions.has(token)) {
     const session = activeSessions.get(token);
-    db.addAuditLog(session.username, "ADMIN_LOGOUT", "-", "Success", "Administrator logged out");
+    db.addAuditLog(session.username, "ADMIN_LOGOUT", "-", "Success", "خروج موفق مدیر از پنل");
     activeSessions.delete(token);
     return true;
   }
   return false;
 }
 
-function requireAdmin(req, res, next) {
+function createSessionCookie(token, isSecure = false) {
+  const secureFlag = isSecure ? '; Secure' : '';
+  return `admin_token=${token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=86400${secureFlag}`;
+}
+
+function clearSessionCookie(isSecure = false) {
+  const secureFlag = isSecure ? '; Secure' : '';
+  return `admin_token=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0${secureFlag}`;
+}
+
+function requireAdmin(req, res) {
   const admin = getAuthenticatedAdmin(req);
   if (!admin) {
     res.writeHead(401, { 'Content-Type': 'application/json; charset=utf-8' });
@@ -109,5 +202,9 @@ module.exports = {
   login,
   logout,
   getAuthenticatedAdmin,
-  requireAdmin
+  requireAdmin,
+  extractClientIp,
+  isRequestSecure,
+  createSessionCookie,
+  clearSessionCookie
 };
